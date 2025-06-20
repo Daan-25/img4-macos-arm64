@@ -4,7 +4,7 @@ This is a compiled version of `img4`, a tool used to create and manipulate Apple
 
 ## About
 
-`img4` is used to sign, verify, and generate Apple firmware files (.img4). This project is adapted and compiled specifically for macOS running on Apple Silicon (M1/M2).
+`img4` is used to sign, verify, and generate Apple firmware files (.img4). This project is adapted and compiled specifically for macOS running on Apple Silicon (M1/M2/M3/M4).
 
 ## Features
 
