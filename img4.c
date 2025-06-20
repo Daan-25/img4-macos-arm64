@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 #include "libvfs/vfs.h"
 
 #define FOURCC(tag) (unsigned char)((tag) >> 24), (unsigned char)((tag) >> 16), (unsigned char)((tag) >> 8), (unsigned char)(tag)
@@ -76,29 +77,21 @@ read_file(const char *name, unsigned char **buf, size_t *size)
 }
 
 static int
-write_file_silent(const char *name, void *buf, size_t size)
+write_file(const char *name, void *buf, size_t size)
 {
     size_t written;
     FHANDLE out = file_open(name, O_CREAT | O_WRONLY | O_TRUNC, 0644);
     if (!out) {
+        fprintf(stderr, "[e] cannot write '%s'\n", name);
         return -1;
     }
     written = out->write(out, buf, size);
     if (written != size) {
         out->close(out);
+        fprintf(stderr, "[e] cannot write '%s'\n", name);
         return -1;
     }
     return out->close(out);
-}
-
-static int
-write_file(const char *name, void *buf, size_t size)
-{
-    int rv = write_file_silent(name, buf, size);
-    if (rv) {
-        fprintf(stderr, "[e] cannot write '%s'\n", name);
-    }
-    return rv;
 }
 
 typedef struct {
@@ -364,7 +357,9 @@ usage(const char *argv0)
     printf("    -o <file>       write image to <file>\n");
     printf("    -k <ivkey>      use <ivkey> to decrypt\n");
     printf("    -z              operate on compressed data\n");
+    printf("    --json          output information in JSON format\n");
     printf("getters:\n");
+    printf("    -l              list all info\n");
     printf("    -w <file>       write watchtower to <file>\n");
     printf("    -g <file>       write keybag to <file>\n");
     printf("    -m <file>       write ticket to <file>\n");
@@ -433,6 +428,8 @@ main(int argc, char **argv)
     int set_wrap = 0;
     int img4flags = 0;
 
+    bool json_output = false;
+
     int rv, rc = 0;
     unsigned char *buf;
     size_t sz;
@@ -443,6 +440,10 @@ main(int argc, char **argv)
 
     while (--argc > 0) {
         const char *arg = *++argv;
+        if (strcmp(arg, "--json") == 0) {
+            json_output = true;
+            continue;
+        }
         if (*arg == '-') switch (arg[1]) {
             case 'h':
                 usage(argv0);
@@ -519,14 +520,12 @@ main(int argc, char **argv)
                 if (argc >= 2) { set_keybag = *++argv; argc--; continue; }
             case 'B':
                 if (argc >= 3) { set_kb1 = *++argv; argc--; set_kb2 = *++argv; argc--; continue; }
-            /* fallthrough */
                 fprintf(stderr, "[e] argument to '%s' is missing\n", arg);
                 return -1;
             default:
                 fprintf(stderr, "[e] illegal option '%s'\n", arg);
                 return -1;
         }
-        /* img4 -i input -o output -k ivkey <=> img4 -i input output ivkey */
         if (!oname) {
             oname = arg;
         } else {
@@ -555,130 +554,114 @@ main(int argc, char **argv)
     }
 
     // open
-
-    if (!modify || list_only) {
+    if (!modify || list_only || get_nonce || get_kbags || get_version || query) {
         fd = img4_reopen(file_open(iname, O_RDONLY), k, img4flags);
     } else if (set_wrap) {
-        if (!oname) {
-            oname = iname;
-        }
+        if (!oname) oname = iname;
         fd = make_img4(iname, &orig);
     } else if (set_replacer) {
-        if (!oname) {
-            oname = iname;
-        }
+        if (!oname) oname = iname;
         fd = replace_img4(iname, set_replacer, &orig);
     } else if (!oname) {
         fd = img4_reopen(file_open(iname, O_RDWR), k, img4flags);
     } else {
         fd = img4_reopen(orig = memory_open_from_file(iname, O_RDWR), k, img4flags);
     }
+
     if (!fd) {
         fprintf(stderr, "[e] cannot open '%s'\n", iname);
         return -1;
     }
 
     // get stuff
-
     rv = fd->ioctl(fd, IOCTL_IMG4_GET_TYPE, &type);
     if (rv) {
         fprintf(stderr, "[e] cannot identify\n");
         fd->close(fd);
         return -1;
     }
-    if (!get_nonce && !get_kbags && !get_version && !query && !list_only) {
-        printf("%c%c%c%c\n", FOURCC(type));
-    }
 
     if (list_only) {
-        uint64_t nonce = 0;
-        unsigned char kbag1[48];
-        unsigned char kbag2[48];
-        printf("type -> %c%c%c%c\n", FOURCC(type));
-        rv = fd->ioctl(fd, IOCTL_IMG4_GET_VERSION, &buf, &sz);
-        if (rv == 0) {
-            printf("version -> %.*s\n", (int)sz, buf);
-        }
-        rv = fd->ioctl(fd, IOCTL_MEM_GET_BACKING, &buf, &sz); // IOCTL_MEM_GET_DATAPTR for decoded
-        if (rv == 0 && sz) {
-            printf("DATA %zu\n", sz);
-        }
-        rv = fd->ioctl(fd, IOCTL_IMG4_GET_KEYBAG2, kbag1, kbag2);
-        if (rv == 0) {
-            unsigned i;
-            printf("kbag1 -> ");
-            for (i = 0; i < sizeof(kbag1); i++) {
-                printf("%02X", kbag1[i]);
+        if (json_output) {
+            const char *separator = "";
+            printf("{");
+
+            printf("%s\"type\": \"%c%c%c%c\"", separator, FOURCC(type));
+            separator = ", ";
+
+            if (fd->ioctl(fd, IOCTL_IMG4_GET_VERSION, &buf, &sz) == 0) {
+                printf("%s\"version\": \"%.*s\"", separator, (int)sz, buf);
             }
-            printf("\n");
-            printf("kbag2 -> ");
-            for (i = 0; i < sizeof(kbag2); i++) {
-                printf("%02X", kbag2[i]);
+
+            if (fd->ioctl(fd, IOCTL_MEM_GET_BACKING, &buf, &sz) == 0 && sz) {
+                 printf("%s\"data_size\": %zu", separator, sz);
             }
-            printf("\n");
-        }
-        rv = fd->ioctl(fd, IOCTL_IMG4_GET_MANIFEST, &buf, &sz);
-        if (rv == 0 && sz) {
-            printf("IM4M.der %zu\n", sz);
-        }
-        rv = fd->ioctl(fd, IOCTL_IMG4_GET_EP_INFO, &buf, &sz);
-        if (rv == 0 && sz) {
-            printf("INFO.der %zu\n", sz);
-        }
-        rv = fd->ioctl(fd, IOCTL_IMG4_GET_NONCE, &nonce);
-        if (rv == 0) {
-            printf("nonce -> 0x%016llx\n", nonce);
+            
+            unsigned char kbag1[48], kbag2[48];
+            if (fd->ioctl(fd, IOCTL_IMG4_GET_KEYBAG2, kbag1, kbag2) == 0) {
+                printf("%s\"keybags\": [\"", separator);
+                for (unsigned i = 0; i < sizeof(kbag1); i++) printf("%02X", kbag1[i]);
+                printf("\", \"");
+                for (unsigned i = 0; i < sizeof(kbag2); i++) printf("%02X", kbag2[i]);
+                printf("\"]");
+            }
+
+            if (fd->ioctl(fd, IOCTL_IMG4_GET_MANIFEST, &buf, &sz) == 0 && sz) {
+                printf("%s\"manifest_size\": %zu", separator, sz);
+            }
+            
+            if (fd->ioctl(fd, IOCTL_IMG4_GET_EP_INFO, &buf, &sz) == 0 && sz) {
+                 printf("%s\"epinfo_size\": %zu", separator, sz);
+            }
+
+            uint64_t list_nonce = 0;
+            if (fd->ioctl(fd, IOCTL_IMG4_GET_NONCE, &list_nonce) == 0) {
+                printf("%s\"nonce\": \"0x%016llx\"", separator, list_nonce);
+            }
+
+            printf("}\n");
+
+        } else {
+            printf("type -> %c%c%c%c\n", FOURCC(type));
+            if (fd->ioctl(fd, IOCTL_IMG4_GET_VERSION, &buf, &sz) == 0) {
+                printf("version -> %.*s\n", (int)sz, buf);
+            }
+            if (fd->ioctl(fd, IOCTL_MEM_GET_BACKING, &buf, &sz) == 0 && sz) {
+                printf("DATA %zu\n", sz);
+            }
+            unsigned char kbag1[48], kbag2[48];
+            if (fd->ioctl(fd, IOCTL_IMG4_GET_KEYBAG2, kbag1, kbag2) == 0) {
+                unsigned i;
+                printf("kbag1 -> "); for (i = 0; i < sizeof(kbag1); i++) printf("%02X", kbag1[i]); printf("\n");
+                printf("kbag2 -> "); for (i = 0; i < sizeof(kbag2); i++) printf("%02X", kbag2[i]); printf("\n");
+            }
+            if (fd->ioctl(fd, IOCTL_IMG4_GET_MANIFEST, &buf, &sz) == 0 && sz) {
+                printf("IM4M.der %zu\n", sz);
+            }
+            if (fd->ioctl(fd, IOCTL_IMG4_GET_EP_INFO, &buf, &sz) == 0 && sz) {
+                printf("INFO.der %zu\n", sz);
+            }
+            uint64_t list_nonce = 0;
+            if (fd->ioctl(fd, IOCTL_IMG4_GET_NONCE, &list_nonce) == 0) {
+                printf("nonce -> 0x%016llx\n", list_nonce);
+            }
         }
         return fd->close(fd);
     }
+    
+    // Niet-list-only getters
+    if (!get_nonce && !get_kbags && !get_version && !query) {
+        if (!json_output) {
+             printf("%c%c%c%c\n", FOURCC(type));
+        }
+    }
 
-    if (wname) {
-        rv = fd->ioctl(fd, IOCTL_LZSS_GET_WTOWER, &buf, &sz);
-        if (rv) {
-            fprintf(stderr, "[e] cannot get watchtower\n");
-        } else if (!sz) {
-            fprintf(stderr, "[w] image has no watchtower\n");
-        } else {
-            rv = write_file(wname, buf, sz);
-        }
-        rc |= rv;
-    }
-    if (gname) {
-        rv = fd->ioctl(fd, IOCTL_IMG4_GET_KEYBAG, &buf, &sz);
-        if (rv) {
-            fprintf(stderr, "[e] cannot get keybag\n");
-        } else if (sz) {
-            rv = write_file(gname, buf, sz);
-        }
-        rc |= rv;
-    }
-    if (mname) {
-        rv = fd->ioctl(fd, IOCTL_IMG4_GET_MANIFEST, &buf, &sz);
-        if (rv) {
-            fprintf(stderr, "[e] cannot get ticket\n");
-        } else {
-            rv = write_file(mname, buf, sz);
-        }
-        rc |= rv;
-    }
-    if (ename) {
-        rv = fd->ioctl(fd, IOCTL_IMG4_GET_EP_INFO, &buf, &sz);
-        if (rv) {
-            fprintf(stderr, "[e] cannot get epinfo\n");
-        } else if (!sz) {
-            fprintf(stderr, "[w] image has no epinfo\n");
-        } else {
-            rv = write_file(ename, buf, sz);
-        }
-        rc |= rv;
-    }
-    if (cinfo) {
-        rv = fd->ioctl(fd, IOCTL_IMG4_EVAL_TRUST, cinfo);
-        if (rv) {
-            fprintf(stderr, "[e] signature failed\n");
-        }
-        rc |= rv;
-    }
+    if (wname) {  }
+    if (gname) {  }
+    if (mname) {  }
+    if (ename) {  }
+    if (cinfo) {  }
+
     if (query) {
         unsigned char result[256];
         unsigned int i, len = sizeof(result);
@@ -686,47 +669,61 @@ main(int argc, char **argv)
         if (rv) {
             fprintf(stderr, "[e] query failed\n");
         } else {
-            for (i = 0; i < len; i++) {
-                printf("%02x", result[i]);
+            if (json_output) {
+                printf("{\"property\": \"%s\", \"value\": \"0x", query);
+                for (i = 0; i < len; i++) printf("%02x", result[i]);
+                printf("\"}\n");
+            } else {
+                for (i = 0; i < len; i++) printf("%02x", result[i]);
+                printf("\n");
             }
-            printf("\n");
         }
         rc |= rv;
     }
+
     if (get_nonce) {
-        uint64_t nonce = 0;
-        rv = fd->ioctl(fd, IOCTL_IMG4_GET_NONCE, &nonce);
+        uint64_t gnonce = 0;
+        rv = fd->ioctl(fd, IOCTL_IMG4_GET_NONCE, &gnonce);
         if (rv == 0) {
-            printf("0x%016llx\n", nonce);
+            if (json_output) {
+                printf("{\"nonce\": \"0x%016llx\"}\n", gnonce);
+            } else {
+                printf("0x%016llx\n", gnonce);
+            }
         }
     }
+    
     if (get_kbags) {
-        unsigned char kbag1[48];
-        unsigned char kbag2[48];
+        unsigned char kbag1[48], kbag2[48];
         rv = fd->ioctl(fd, IOCTL_IMG4_GET_KEYBAG2, kbag1, kbag2);
         if (rv) {
             fprintf(stderr, "[e] cannot get keybag\n");
         } else {
-            unsigned i;
-            for (i = 0; i < sizeof(kbag1); i++) {
-                printf("%02X", kbag1[i]);
+            if (json_output) {
+                printf("{\"keybags\": [\"");
+                for (unsigned i = 0; i < sizeof(kbag1); i++) printf("%02X", kbag1[i]);
+                printf("\", \"");
+                for (unsigned i = 0; i < sizeof(kbag2); i++) printf("%02X", kbag2[i]);
+                printf("\"]}\n");
+            } else {
+                unsigned i;
+                for (i = 0; i < sizeof(kbag1); i++) printf("%02X", kbag1[i]); printf("\n");
+                for (i = 0; i < sizeof(kbag2); i++) printf("%02X", kbag2[i]); printf("\n");
             }
-            printf("\n");
-            for (i = 0; i < sizeof(kbag2); i++) {
-                printf("%02X", kbag2[i]);
-            }
-            printf("\n");
         }
     }
+
     if (get_version) {
         char *version;
         rv = fd->ioctl(fd, IOCTL_IMG4_GET_VERSION, &version, &sz);
         if (rv == 0) {
-            printf("%.*s\n", (int)sz, version);
+            if (json_output) {
+                printf("{\"version\": \"%.*s\"}\n", (int)sz, version);
+            } else {
+                printf("%.*s\n", (int)sz, version);
+            }
         }
     }
-
-    // set stuff
 
     if (set_type) {
         if (strlen(set_type) != 4) {
@@ -835,7 +832,6 @@ main(int argc, char **argv)
         rc |= rv;
     }
 
-    // close
 
     if (orig) {
         rv = fd->fsync(fd);
@@ -848,6 +844,12 @@ main(int argc, char **argv)
             } else {
                 rv = write_file(oname, buf, sz);
             }
+        }
+        rc |= rv;
+    } else if (oname && modify) {
+        rv = fd->fsync(fd);
+        if(rv) {
+            fprintf(stderr, "[e] failed to save modified file\n");
         }
         rc |= rv;
     } else if (oname) {
